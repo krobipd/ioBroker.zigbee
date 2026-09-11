@@ -5,19 +5,10 @@
  */
 'use strict';
 
-let debug;
-try {
-    debug = require('zigbee-herdsman/node_modules/debug');
-} catch (e) {
-    debug = undefined;
-}
-const originalLogMethod = debug ? debug.log : undefined;
-
 // node components
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const util = require('node:util');
 const dns = require('node:dns');
 const net = require('node:net');
 
@@ -38,6 +29,7 @@ const { devLabel } = require('./lib/deviceLabel');
 const dmZigbee  = require('./lib/devicemgmt.js');
 const DeviceDebug = require('./lib/DeviceDebug');
 const localConfig = require('./lib/localConfig');
+const { LibraryLogBridge } = require('./lib/libraryLog');
 const ZigbeeController = require('./lib/zigbeecontroller');
 const StatesController = require('./lib/statescontroller');
 
@@ -223,26 +215,16 @@ class Zigbee extends adapterCore.Adapter {
         }
     }
 
-    debugLog(data, ...args) {
-        const message = (args) ? util.format(data, ...args) : data;
-        if (this.debugActive) this.log.debug(message.slice(message.indexOf('zigbee-herdsman')));
-    }
-
     async onReady() {
 
         const dbActive = await this.getForeignState(`system.adapter.${this.namespace}.logLevel`);
         this.debugActive = (dbActive && dbActive.val === 'debug');
         this.log.info('Adapter ready - starting subsystems. Adapter is running in '+(dbActive?.val ?? 'unknown')+ ' mode.');
-        if (this.config.debugHerdsman) {
-            if (debug) {
-                this.log.warn('Activating zigbee-herdsman debug connection - successful');
-                debug.log = this.debugLog.bind(this);
-                debug.enable('zigbee-herdsman*');
-            }
-            else {
-                this.log.warn('Activating zigbee-herdsman debug connection - failed: debug library not available');
-            }
-        }
+        // route the log output of zigbee-herdsman and zigbee-herdsman-converters into the adapter log
+        this.libraryLog = new LibraryLogBridge(this);
+        const bridged = this.libraryLog.install();
+        this.log.info(`Library log output attached for ${bridged.join(', ') || 'no library'}` +
+            (this.config.debugHerdsman ? ' (including debug output)' : ''));
         // external converters
         this.applyExternalConverters();
 
@@ -843,24 +825,20 @@ class Zigbee extends adapterCore.Adapter {
             this.log.info(`Halting zigbee adapter. Restart delay is at least ${this.ioPack.common.stopTimeout / 1000} seconds.`)
             this.setState('info.connection', false, true);
             const chain = [];
-            if (this.config.debugHerdsman) {
-                if (debug) {
-                    debug.disable();
-                    debug.log = originalLogMethod;
-                }
-            }
             this.log.info('cleaning everything up');
             await this.callPluginMethod('stop');
             if (this.stController) chain.push(this.stController.stop());
             if (this.zbController) chain.push(this.zbController.stop());
             await Promise.all(chain);
             this.log.info('cleanup successful');
+            if (this.libraryLog) this.libraryLog.stop();
             callback();
         } catch (error) {
             if (error) {
                 this.log.error(`Unload error (${error.stack})`);
             }
             this.sendError(error, `Unload error`);
+            if (this.libraryLog) this.libraryLog.stop();
             callback();
         }
     }
@@ -934,6 +912,7 @@ class Zigbee extends adapterCore.Adapter {
             extPanIdFix: extPanIdFix,
             startWithInconsistent: override.startWithInconsistent ? override.startWithInconsistent: this.config.startWithInconsistent || false,
             availableUpdateTime:this.config.availableUpdateTime,
+            blocklist: this.config.blocklist,
         };
     }
 

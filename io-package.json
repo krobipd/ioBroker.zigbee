@@ -282,6 +282,7 @@
     "countDown": 60,
     "adapterType": "zstack",
     "debugHerdsman": false,
+    "blocklist": [],
     "disablePing": false,
     "disableBackup": false,
     "external": "",
