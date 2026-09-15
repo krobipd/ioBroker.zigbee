@@ -712,8 +712,9 @@ class Zigbee extends adapterCore.Adapter {
             else (this.log.debug('resolveEntity returned no entity'));
         }
         finally {
-            // messages of the device waiting for its registration go on now, whether it succeeded or not
-            if (device?.ieeeAddr) this.stController.deviceRegistered(device.ieeeAddr);
+            // after a rebuild the model was registered here - messages of the device waiting for it go on now,
+            // whether it succeeded or not (the plain sync registers nothing, newDevice() does that)
+            if (rebuild && device?.ieeeAddr) this.stController.deviceRegistered(device.ieeeAddr);
         }
     }
 

@@ -377,6 +377,28 @@ describe('a message that arrives before its device is registered', { timeout: 10
         assert.deepStrictEqual(temperatureWrites(adapter).map(w => w.val), [21, 22, 23]);
     });
 
+    it('a plain syncDeviceState() (no rebuild) registers nothing and does not release a waiting message', async () => {
+        const { adapter, st, stashed } = await fresh();
+        const entity = await weatherEntity();
+
+        const done = st.onZigbeeEvent('attributeReport', entity, temperatureReport(entity.device, 2150));
+        await settled();
+        adapter.zbController.resolveEntity = () => Promise.resolve(entity);
+        await adapter.syncDeviceState(entity.device, false); // the start runs this for every device after 'ready'
+        await settled();
+        assert.strictEqual(st.registrationGates.size, 1, 'still waiting for newDevice()');
+        assert.ok(!st.registeredDevices.has(IEEE));
+        assert.deepStrictEqual(temperatureWrites(adapter), []);
+        // the sync itself looked the model up without a registration (its own stash, not the message's)
+        const stashedBySync = stashed.length;
+
+        await adapter.newDevice(entity);
+        await done;
+        await settled();
+        assert.strictEqual(stashed.length, stashedBySync, 'the message found the model');
+        assert.deepStrictEqual(temperatureWrites(adapter).map(w => w.val), [21.5]);
+    });
+
     it('waits again after the model definitions were cleared until syncDeviceState() registered the device', async () => {
         const { adapter, st, stashed } = await fresh();
         const entity = await weatherEntity();
