@@ -231,7 +231,7 @@ describe('join trace', () => {
             const bridge = bridgeFor(adapter);
             bridge.handle('debug', POLICY_LINE, 'zh:ember');
             bridge.handle('debug', "[EzspPolicyId] SET 'TC_KEY_REQUEST_POLICY' TO '81' with status=OK.", 'zh:ember');
-            bridge.handle('error', "[INIT TC] Failed to set TRUST_CENTER_POLICY with status=FAIL.", 'zh:ember');
+            bridge.handle('error', '[INIT TC] Failed to set TRUST_CENTER_POLICY with status=FAIL.', 'zh:ember');
             assert.deepStrictEqual(adapter.lines, [
                 ['info', `[zh:ember] ${POLICY_LINE}`],
                 ['error', '[zh:ember] [INIT TC] Failed to set TRUST_CENTER_POLICY with status=FAIL.'],
