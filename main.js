@@ -695,21 +695,26 @@ class Zigbee extends adapterCore.Adapter {
     }
 
     async syncDeviceState(device, rebuild) {
-        if (rebuild) {
-            const hM = await zigbeeHerdsmanConverters.findByDevice(device);
-            await this.stController.AddModelFromHerdsman(device, hM ? hM.model : device.modelID);
-        }
-        // remove from the Adapter device list
+        try {
+            if (rebuild) {
+                const hM = await zigbeeHerdsmanConverters.findByDevice(device);
+                await this.stController.AddModelFromHerdsman(device, hM ? hM.model : device.modelID);
+            }
+            // remove from the Adapter device list
 
-        // if it has a mapped model - update its states
-        const entity = await this.zbController.resolveEntity(device);
-        if (entity) {
-            const model = entity.mapped ? entity.mapped.model : entity.device.modelID;
-            await this.stController.updateDev(utils.zbIdorIeeetoAdId(this, device.ieeeAddr, false), entity.name, model);
-            await this.stController.syncDevStates(device, model);
+            // if it has a mapped model - update its states
+            const entity = await this.zbController.resolveEntity(device);
+            if (entity) {
+                const model = entity.mapped ? entity.mapped.model : entity.device.modelID;
+                await this.stController.updateDev(utils.zbIdorIeeetoAdId(this, device.ieeeAddr, false), entity.name, model);
+                await this.stController.syncDevStates(device, model);
+            }
+            else (this.log.debug('resolveEntity returned no entity'));
         }
-        else (this.log.debug('resolveEntity returned no entity'));
-
+        finally {
+            // messages of the device waiting for its registration go on now, whether it succeeded or not
+            if (device?.ieeeAddr) this.stController.deviceRegistered(device.ieeeAddr);
+        }
     }
 
     async syncAllDeviceStates(rebuildStates) {
@@ -758,7 +763,18 @@ class Zigbee extends adapterCore.Adapter {
     }
 
 
+    // Registers a device (model definition, device and state objects). Messages the device sends in the
+    // meantime wait in onZigbeeEvent() until this is through - so the release must happen in every case.
     async newDevice(entity, fromInterview) {
+        try {
+            await this.registerDevice(entity, fromInterview);
+        }
+        finally {
+            if (entity?.device?.ieeeAddr) this.stController.deviceRegistered(entity.device.ieeeAddr);
+        }
+    }
+
+    async registerDevice(entity, fromInterview) {
 
         const device = entity.device;
         const model = (entity.mapped) ? entity.mapped.model : device.modelID;
