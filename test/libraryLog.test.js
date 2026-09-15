@@ -2,7 +2,8 @@
 
 // Tests for lib/libraryLog.js - the bridge that routes the log output of zigbee-herdsman and
 // zigbee-herdsman-converters into the adapter log, plus the join trace for devices that never
-// completed their interview. No hardware, no network; the herdsman controller is a stub.
+// completed their interview (per device: its IEEE address always, its network address for
+// TRACE_WINDOW_MS after the join line). No hardware, no network; the herdsman controller is a stub.
 // Run:  node --test test/libraryLog.test.js
 
 const { describe, it } = require('node:test');
@@ -20,9 +21,11 @@ const UNKNOWN = '0x70c59cfffe2c43f5'; // not in the database at all
 const COORDINATOR = '0x00124b0029c1c8d4';
 
 // line texts as zigbee-herdsman 10.9.1 writes them
-const JOIN_LINE = `ezspTrustCenterJoinHandler: newNodeId=44772 newNodeEui64=${GHOST} status=STANDARD_SECURITY_SECURED_REJOIN policyDecision=USE_PRECONFIGURED_KEY parentOfNewNodeId=12345`;
+const JOIN_LINE = `ezspTrustCenterJoinHandler: newNodeId=44772 newNodeEui64=${GHOST} status=STANDARD_SECURITY_UNSECURED_JOIN policyDecision=USE_PRECONFIGURED_KEY parentOfNewNodeId=17714`;
 const SENT_LINE = '~~~> [SENT ZDO UNICAST messageTag=17 apsSequence=201 status=OK]';
 const DELIVERY_LINE = '~x~> DELIVERY_FAILED [indexOrDestination=44772 apsFrame={"profileId":0} messageTag=17]';
+const ROUTE_ERROR_LINE = 'ezspIncomingNetworkStatusHandler: errorCode=ROUTE_ERROR_SOURCE_ROUTE_FAILURE target=44772';
+const POLICY_LINE = "[EzspPolicyId] SET 'TRUST_CENTER_POLICY' TO '2' with status=OK.";
 
 function fakeAdapter({ debugHerdsman = false, permitJoin = false, withController = true } = {}) {
     const lines = [];
@@ -124,50 +127,93 @@ describe('join trace', () => {
         bridge.handle('debug', 'Delivery of BROADCAST failed for 0xffffffffffffffff', 'zh:ember');
         bridge.handle('debug', 'blank 0x0000000000000000 target', 'zh:ember');
         assert.deepStrictEqual(adapter.lines, []);
-        assert.strictEqual(bridge.traceUntil, 0);
+        assert.strictEqual(bridge.tracked.size, 0);
     });
 
-    it('opens the window on the join line and keeps all library lines at info until it closes', () => {
+    it('registers the network address on the join line and keeps the lines carrying only that address at info until the window closes', () => {
         const clock = { t: 1000000 };
         const adapter = fakeAdapter();
         const bridge = bridgeFor(adapter, clock);
         bridge.handle('debug', JOIN_LINE, 'zh:ember:ezsp');
+        assert.strictEqual(bridge.tracked.get(GHOST).nwk, '44772');
+        assert.strictEqual(bridge.tracked.get(GHOST).until, 1000000 + TRACE_WINDOW_MS);
         clock.t += 5000;
         bridge.handle('debug', SENT_LINE, 'zh:ember');
         bridge.handle('debug', DELIVERY_LINE, 'zh:ember');
         bridge.handle('info', 'unrelated info', 'zh:controller');
+        bridge.handle('debug', ROUTE_ERROR_LINE, 'zh:ember:ezsp');
         clock.t = 1000000 + TRACE_WINDOW_MS - 1;
-        bridge.handle('debug', 'last one inside', 'zh:ember');
+        bridge.handle('debug', DELIVERY_LINE, 'zh:ember');
         clock.t = 1000000 + TRACE_WINDOW_MS;
-        bridge.handle('debug', 'first one outside', 'zh:ember');
+        bridge.handle('debug', DELIVERY_LINE, 'zh:ember');
         bridge.handle('info', 'info outside', 'zh:ember');
         assert.deepStrictEqual(adapter.lines, [
             ['info', `[trace zh:ember:ezsp] ${JOIN_LINE}`],
-            ['info', `[trace zh:ember] ${SENT_LINE}`],
             ['info', `[trace zh:ember] ${DELIVERY_LINE}`],
-            ['info', '[trace zh:controller] unrelated info'],
-            ['info', '[trace zh:ember] last one inside'],
+            ['debug', '[zh:controller] unrelated info'],
+            ['info', `[trace zh:ember:ezsp] ${ROUTE_ERROR_LINE}`],
+            ['info', `[trace zh:ember] ${DELIVERY_LINE}`],
             ['debug', '[zh:ember] info outside'],
         ]);
+        assert.strictEqual(bridge.tracked.size, 0, 'the entry is dropped when its window closes');
     });
 
-    it('does not open the window on a line without a join marker, even for a traced device', () => {
+    it('matches the network address only where it stands alone in the line', () => {
+        const adapter = fakeAdapter();
+        const bridge = bridgeFor(adapter);
+        bridge.handle('debug', JOIN_LINE, 'zh:ember:ezsp');
+        bridge.handle('debug', 'ezspMessageSentHandler: status=OK type=DIRECT indexOrDestination=144772 messageTag=3', 'zh:ember:ezsp');
+        bridge.handle('debug', 'ezspIncomingRouteErrorHandler: status=ZIGBEE_SOURCE_ROUTE_FAILURE target=447721', 'zh:ember:ezsp');
+        bridge.handle('debug', '<=== [CBFRAME: ID=44772:"INCOMING_MESSAGE_HANDLER" Seq=4 Len=4772]', 'zh:ember:ezsp');
+        bridge.handle('error', 'Failed to remove rejected device: {"target":44772,"apsFrame":{"profileId":0,"clusterId":52}} timed out after 10000ms', 'zh:controller');
+        bridge.handle('debug', 'Received payload: clusterID=6, address=44772, groupID=0, endpoint=1', 'zh:controller');
+        assert.deepStrictEqual(adapter.lines.map(l => l[0]), ['info', 'info', 'info', 'info']);
+        assert.ok(adapter.lines[1][1].includes('CBFRAME: ID=44772'), 'a bare 44772 counts, wherever it stands');
+        assert.ok(adapter.lines[2][1].includes('"target":44772'));
+        assert.ok(adapter.lines[3][1].includes('address=44772'));
+    });
+
+    it('does not register a device on a line without a join marker, even a traced one', () => {
         const clock = { t: 5000 };
         const adapter = fakeAdapter();
         const bridge = bridgeFor(adapter, clock);
         bridge.handle('debug', `Candidates for ${GHOST}/undefined: ZYCT-202/Trust`, 'zhc:index');
-        bridge.handle('debug', 'context line', 'zh:ember');
-        assert.deepStrictEqual(adapter.lines, [['info', `[trace zhc:index] Candidates for ${GHOST}/undefined: ZYCT-202/Trust`]]);
-        assert.strictEqual(bridge.traceUntil, 0);
+        bridge.handle('debug', `~~~> [ZDO NODE_DESCRIPTOR_REQUEST UNICAST to=${GHOST}:44772 messageTag=1 payload=0000]`, 'zh:ember');
+        bridge.handle('debug', DELIVERY_LINE, 'zh:ember');
+        assert.deepStrictEqual(adapter.lines.map(l => l[0]), ['info', 'info']);
+        assert.strictEqual(bridge.tracked.size, 0);
     });
 
-    it('opens the window on the controller join line and on a rejected join as well', () => {
-        for (const line of [`New device '${UNKNOWN}' joined`, `Device '${GHOST}' rejected by handler, removing it`]) {
+    it('registers the device on the controller join line and on a rejected join, and learns the address from a later request line', () => {
+        for (const line of [`New device '${UNKNOWN}' joined`, `Device '${UNKNOWN}' rejected by handler, removing it`]) {
             const clock = { t: 42 };
             const bridge = bridgeFor(fakeAdapter(), clock);
             bridge.handle('debug', line, 'zh:controller');
-            assert.strictEqual(bridge.traceUntil, 42 + TRACE_WINDOW_MS, line);
+            assert.deepStrictEqual(bridge.tracked.get(UNKNOWN), { nwk: undefined, pattern: undefined, until: 42 + TRACE_WINDOW_MS }, line);
+            clock.t = 50;
+            bridge.handle('debug', `~~~> [ZDO LEAVE_REQUEST UNICAST to=${UNKNOWN}:13619 messageTag=7 payload=00]`, 'zh:ember');
+            assert.strictEqual(bridge.tracked.get(UNKNOWN).nwk, '13619');
+            assert.strictEqual(bridge.tracked.get(UNKNOWN).until, 42 + TRACE_WINDOW_MS, 'a request line does not extend the window');
         }
+    });
+
+    it('replaces the network address when the device joins again with a new one', () => {
+        const adapter = fakeAdapter();
+        const bridge = bridgeFor(adapter);
+        bridge.handle('debug', JOIN_LINE, 'zh:ember:ezsp');
+        bridge.handle('debug', JOIN_LINE.replace('newNodeId=44772', 'newNodeId=48497'), 'zh:ember:ezsp');
+        bridge.handle('debug', DELIVERY_LINE, 'zh:ember');
+        bridge.handle('debug', DELIVERY_LINE.replace('44772', '48497'), 'zh:ember');
+        assert.strictEqual(bridge.tracked.size, 1);
+        assert.strictEqual(bridge.tracked.get(GHOST).nwk, '48497');
+        assert.deepStrictEqual(adapter.lines.slice(2), [['info', `[trace zh:ember] ${DELIVERY_LINE.replace('44772', '48497')}`]]);
+    });
+
+    it('never registers the coordinator address 0 as a network address', () => {
+        const bridge = bridgeFor(fakeAdapter());
+        bridge.handle('debug', JOIN_LINE.replace('newNodeId=44772', 'newNodeId=0'), 'zh:ember:ezsp');
+        assert.strictEqual(bridge.tracked.get(GHOST).nwk, undefined);
+        assert.strictEqual(bridge.tracked.get(GHOST).pattern, undefined);
     });
 
     it('traces nothing while the network is open for joining', () => {
@@ -176,7 +222,17 @@ describe('join trace', () => {
         bridge.handle('debug', JOIN_LINE, 'zh:ember:ezsp');
         bridge.handle('error', `Interview failed for '${UNKNOWN}'`, 'zh:controller');
         assert.deepStrictEqual(adapter.lines, [['error', `[zh:controller] Interview failed for '${UNKNOWN}'`]]);
-        assert.strictEqual(bridge.traceUntil, 0);
+        assert.strictEqual(bridge.tracked.size, 0);
+    });
+
+    it('logs the join policy lines of the coordinator at info level, open network or not', () => {
+        for (const permitJoin of [false, true]) {
+            const adapter = fakeAdapter({ permitJoin });
+            const bridge = bridgeFor(adapter);
+            bridge.handle('debug', POLICY_LINE, 'zh:ember');
+            bridge.handle('debug', "[EzspPolicyId] SET 'TC_KEY_REQUEST_POLICY' TO '81' with status=OK.", 'zh:ember');
+            assert.deepStrictEqual(adapter.lines, [['info', `[zh:ember] ${POLICY_LINE}`]], `permitJoin=${permitJoin}`);
+        }
     });
 });
 
@@ -207,7 +263,7 @@ describe('robustness', () => {
         bridge.handle('error', `Interview failed for '${GHOST}'`, 'zh:controller');
         bridge.handle('debug', `Device '${GHOST}' joined`, 'zh:controller');
         assert.deepStrictEqual(adapter.lines, [['error', `[zh:controller] Interview failed for '${GHOST}'`]]);
-        assert.strictEqual(bridge.traceUntil, 0);
+        assert.strictEqual(bridge.tracked.size, 0);
     });
 
     it('survives a device lookup that logs through the bridge itself (no recursion, nothing lost)', () => {
@@ -222,7 +278,7 @@ describe('robustness', () => {
             ['warn', `[zh:controller:database] loading database for ${UNKNOWN}`],
             ['info', `[trace zh:controller] Device '${UNKNOWN}' joined`],
         ]);
-        assert.notStrictEqual(bridge.traceUntil, 0);
+        assert.ok(bridge.tracked.has(UNKNOWN));
     });
 
     it('never throws: broken adapter log, throwing lambda, missing config', () => {
@@ -351,11 +407,11 @@ describe('join blocklist in the controller', () => {
     });
 });
 
-describe('the real line sequence of a rejoin (formats of zigbee-herdsman 10.9.1)', () => {
+describe('the real line sequences of a join (formats of zigbee-herdsman 10.9.1)', () => {
     // one failed interview as herdsman logs it: join, six node descriptor attempts of ~11 s each with
     // the delivery status lines that carry only the network address, then the final error lines
     function failedInterview(bridge, clock, nwk, tagBase) {
-        bridge.handle('debug', `ezspTrustCenterJoinHandler: newNodeId=${nwk} newNodeEui64=${GHOST} status=STANDARD_SECURITY_SECURED_REJOIN policyDecision=USE_PRECONFIGURED_KEY parentOfNewNodeId=12345`, 'zh:ember:ezsp');
+        bridge.handle('debug', `ezspTrustCenterJoinHandler: newNodeId=${nwk} newNodeEui64=${GHOST} status=STANDARD_SECURITY_UNSECURED_JOIN policyDecision=USE_PRECONFIGURED_KEY parentOfNewNodeId=17714`, 'zh:ember:ezsp');
         bridge.handle('debug', `Device '${GHOST}' joined`, 'zh:controller');
         bridge.handle('info', `Interview for '${GHOST}' started`, 'zh:controller');
         bridge.handle('debug', `Interview - start device '${GHOST}'`, 'zh:controller:device');
@@ -372,44 +428,76 @@ describe('the real line sequence of a rejoin (formats of zigbee-herdsman 10.9.1)
         bridge.handle('debug', `Interview - failed for device '${GHOST}' with error 'Error: Interview failed because can not get node descriptor ('${GHOST}')'`, 'zh:controller:device');
         bridge.handle('error', `Interview failed for '${GHOST} with error 'Error: Interview failed because can not get node descriptor ('${GHOST}')'`, 'zh:controller');
     }
+    // the lines about the device: 4 at the join, 4 per attempt (the SENT line carries no address), 2 at the end
+    const LINES_PER_INTERVIEW = 4 + 6 * 4 + 2;
 
-    it('keeps every line of a failed interview at info level, including the status lines without IEEE', () => {
+    // the chatter of the rest of the network while an interview runs, as herdsman logs it
+    function chatter(bridge) {
+        bridge.handle('debug', '<=== [CBFRAME: ID=69:"INCOMING_MESSAGE_HANDLER" Seq=200 Len=45]', 'zh:ember:ezsp');
+        bridge.handle('debug', `ezspIncomingMessageHandler: type=UNICAST apsFrame={"profileId":260,"clusterId":1794} lastHopLqi=255 sender=17714`, 'zh:ember:ezsp');
+        bridge.handle('debug', `Received payload: clusterID=1794, address=17714, groupID=0, endpoint=1, destinationEndpoint=1, wasBroadcast=false, linkQuality=255, frame={"header":{"frameControl":{"frameType":0}}}`, 'zh:controller');
+        bridge.handle('debug', `ZCL command ${KNOWN}/1 seMetering.defaultRsp({"cmdId":10,"statusCode":0}, {"timeout":10000})`, 'zh:controller:endpoint');
+        bridge.handle('debug', 'Getting definitions for: shelly.js,4', 'zhc');
+        bridge.handle('debug', `Candidates for ${KNOWN}/Power Strip: SNPL-00416EU/Shelly`, 'zhc');
+        bridge.handle('debug', "Interview - quirks check for 'undefined'-'undefined'-'Unknown'", 'zh:controller:device');
+    }
+
+    it('keeps every line about the device at info level, including the status lines that carry only its network address, and drops the chatter around it', () => {
         const clock = { t: 1_000_000 };
         const adapter = fakeAdapter();
         const bridge = bridgeFor(adapter, clock);
+        chatter(bridge);
         failedInterview(bridge, clock, 44772, 10);
-        assert.strictEqual(adapter.lines.length, 4 + 6 * 5 + 2);
+        chatter(bridge);
+        assert.strictEqual(adapter.lines.length, LINES_PER_INTERVIEW);
         assert.deepStrictEqual([...new Set(adapter.lines.map(l => l[0]))], ['info']);
         assert.ok(adapter.lines.every(l => l[1].startsWith('[trace ')));
+        assert.ok(!adapter.lines.some(l => l[1].includes('SENT ZDO UNICAST')), 'a line without any address of the device is not part of the trace');
         assert.ok(clock.t - 1_000_000 < TRACE_WINDOW_MS, 'an interview of six attempts fits into the window');
     });
 
-    it('opens a fresh window for the next rejoin minutes later and drops unrelated chatter in between', () => {
+    it('registers the next join minutes later afresh and drops a late status line of the old address in between', () => {
         const clock = { t: 1_000_000 };
         const adapter = fakeAdapter();
         const bridge = bridgeFor(adapter, clock);
         failedInterview(bridge, clock, 44772, 10);
         clock.t += TRACE_WINDOW_MS; // well past the first window
-        bridge.handle('debug', 'unrelated frame between the rejoins', 'zh:ember:ezsp');
+        bridge.handle('debug', 'ezspIncomingRouteErrorHandler: status=ZIGBEE_SOURCE_ROUTE_FAILURE target=44772', 'zh:ember:ezsp');
+        bridge.handle('debug', 'unrelated frame between the joins', 'zh:ember:ezsp');
         const before = adapter.lines.length;
-        failedInterview(bridge, clock, 44772, 30);
-        assert.strictEqual(adapter.lines.length, before + 4 + 6 * 5 + 2);
+        assert.strictEqual(before, LINES_PER_INTERVIEW);
+        failedInterview(bridge, clock, 48497, 30);
+        assert.strictEqual(adapter.lines.length, before + LINES_PER_INTERVIEW);
         assert.ok(!adapter.lines.some(l => l[1].includes('unrelated frame')));
         assert.deepStrictEqual([...new Set(adapter.lines.map(l => l[0]))], ['info']);
     });
 
-    it('a blocked rejoin ends with the unreachable leave request at info level, not as an error', () => {
+    it('a blocked join ends with the unreachable leave request at info level, not as an error', () => {
         const clock = { t: 5_000_000 };
         const adapter = fakeAdapter();
         const bridge = bridgeFor(adapter, clock);
-        bridge.handle('debug', `ezspTrustCenterJoinHandler: newNodeId=44772 newNodeEui64=${GHOST} status=STANDARD_SECURITY_SECURED_REJOIN policyDecision=USE_PRECONFIGURED_KEY parentOfNewNodeId=0`, 'zh:ember:ezsp');
+        bridge.handle('debug', `ezspTrustCenterJoinHandler: newNodeId=44772 newNodeEui64=${GHOST} status=STANDARD_SECURITY_UNSECURED_JOIN policyDecision=USE_PRECONFIGURED_KEY parentOfNewNodeId=17714`, 'zh:ember:ezsp');
         bridge.handle('debug', `Device '${GHOST}' joined`, 'zh:controller');
         bridge.handle('debug', `Device '${GHOST}' rejected by handler, removing it`, 'zh:controller');
         bridge.handle('debug', `~~~> [ZDO LEAVE_REQUEST UNICAST to=${GHOST}:44772 messageTag=7 payload=00]`, 'zh:ember');
         bridge.handle('debug', '~~~> [SENT ZDO UNICAST messageTag=7 apsSequence=9 status=OK]', 'zh:ember');
         clock.t += 10_000;
         bridge.handle('error', 'Failed to remove rejected device: {"target":44772,"apsFrame":{"profileId":0,"clusterId":52},"zdoResponseClusterId":32820} timed out after 10000ms', 'zh:controller');
-        assert.strictEqual(adapter.lines.length, 6);
+        assert.strictEqual(adapter.lines.length, 5);
         assert.deepStrictEqual([...new Set(adapter.lines.map(l => l[0]))], ['info']);
+        assert.ok(adapter.lines[4][1].startsWith('[trace zh:controller] Failed to remove rejected device'));
+    });
+
+    it('a join the coordinator denies shows as two lines and registers nothing to interview', () => {
+        const adapter = fakeAdapter();
+        const bridge = bridgeFor(adapter);
+        bridge.handle('debug', `ezspTrustCenterJoinHandler: newNodeId=44772 newNodeEui64=${GHOST} status=STANDARD_SECURITY_UNSECURED_JOIN policyDecision=DENY_JOIN parentOfNewNodeId=17714`, 'zh:ember:ezsp');
+        bridge.handle('warning', `[TRUST CENTER] Device 44772:${GHOST} was denied joining via 17714.`, 'zh:ember');
+        bridge.handle('debug', 'ezspIncomingRouteErrorHandler: status=ZIGBEE_SOURCE_ROUTE_FAILURE target=44772', 'zh:ember:ezsp');
+        assert.deepStrictEqual(adapter.lines, [
+            ['info', `[trace zh:ember:ezsp] ezspTrustCenterJoinHandler: newNodeId=44772 newNodeEui64=${GHOST} status=STANDARD_SECURITY_UNSECURED_JOIN policyDecision=DENY_JOIN parentOfNewNodeId=17714`],
+            ['info', `[trace zh:ember] [TRUST CENTER] Device 44772:${GHOST} was denied joining via 17714.`],
+            ['info', '[trace zh:ember:ezsp] ezspIncomingRouteErrorHandler: status=ZIGBEE_SOURCE_ROUTE_FAILURE target=44772'],
+        ]);
     });
 });
